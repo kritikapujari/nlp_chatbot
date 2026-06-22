@@ -1,85 +1,152 @@
-# 🦩 Llama-based RAG Streamlit App to Extract Disease Info (with Ollama)
-
 import streamlit as st
-from langchain.document_loaders.csv_loader import CSVLoader
+from langchain_community.document_loaders import CSVLoader
 from langchain.text_splitter import CharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from langchain_community.llms import Ollama
+from langchain_groq import ChatGroq
 import os
 
-
-
-# 1. Load and preprocess data (assuming a .csv file with a 'text' column)
+# Load and preprocess data
 @st.cache_data
 def load_data():
     try:
         file_path = "medical_data.csv"
-        loader = CSVLoader(file_path=file_path, source_column="output", encoding="utf-8")
+
+        if not os.path.exists(file_path):
+            st.error(f"❌ File '{file_path}' not found.")
+            return []
+
+        loader = CSVLoader(
+            file_path=file_path,
+            source_column="output",
+            encoding="utf-8"
+        )
+
         docs = loader.load()
-        splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+
+        if not docs:
+            st.warning("No documents found in CSV.")
+            return []
+
+        splitter = CharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100
+        )
+
         return splitter.split_documents(docs)
+
     except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
-        st.error(f"Currentstr working directory: {os.getcwd()}")
+        st.error(f"Error loading data: {e}")
         return []
 
-# 2. Set up vectorstore with HuggingFace embeddings
+
+# Create vector database
 @st.cache_resource
-def create_vectorstore(_documents):  # fixed argument name
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+def create_vectorstore(_documents):
+    if not _documents:
+        return None
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+
     return FAISS.from_documents(_documents, embeddings)
 
-# 3. Initialize Ollama Llama model
-@st.cache_resource
-def load_llama():
-    return Ollama(model="llama3.2:latest")  # Replace with your pulled model from `ollama list`
 
-# 4. Set up RAG chain
+# Load Groq LLM
 @st.cache_resource
-def setup_rag_chain(_vectorstore):
-    prompt_template = PromptTemplate(
-        input_variables=["context"],
+def load_llm():
+    try:
+        api_key = st.secrets["GROQ_API_KEY"]
+
+        return ChatGroq(
+            model="llama3-70b-8192",
+            api_key=api_key,
+            temperature=0.2,
+            max_retries=2,
+        )
+
+    except Exception:
+        st.error("🚫 GROQ_API_KEY not found in Streamlit Secrets.")
+        return None
+
+
+# Setup RAG chain
+@st.cache_resource
+def setup_rag_chain(_vectorstore, _llm):
+    if _vectorstore is None or _llm is None:
+        return None
+
+    prompt = PromptTemplate(
+        input_variables=["context", "question"],
         template="""
-You are an expert medical assistant. From the medical text below, extract the following details clearly and present them in simple plain English (no JSON):
+You are an expert medical assistant.
 
-- Symptoms
-- Treatment
-- Impact on Pregnancy
-- Mental Health Impact
-- Age group affected
+Use ONLY the provided medical text to answer the question.
 
-Use bullet points or short paragraphs for clarity. Do not include any formatting or code blocks. Dont write text like Here are the extracted details in simple plain English in response:
+Question:
+{question}
 
-Text:
+Medical Text:
 {context}
+
+Provide the following information in simple English:
+
+Symptoms:
+Treatment:
+Impact on Pregnancy:
+Mental Health Impact:
+Age Group Affected:
+
+Answer:
 """
     )
 
     retriever = _vectorstore.as_retriever()
-    llama = load_llama()
+
     return RetrievalQA.from_chain_type(
-        llm=llama,
+        llm=_llm,
         retriever=retriever,
-        chain_type_kwargs={"prompt": prompt_template}
+        chain_type="stuff",
+        chain_type_kwargs={"prompt": prompt},
+        return_source_documents=False,
     )
 
-# 5. Streamlit UI
+
+# Streamlit UI
+st.set_page_config(
+    page_title="Medical Data ChatBot",
+    layout="centered"
+)
+
 st.title("🩺 Medical Data ChatBot")
 
-query = st.text_input("Enter a disease name to extract info:")
-if query:
-    with st.spinner("Processing..."):
-        documents = load_data()
-        st.write(f"Loaded {len(documents)} documents.")
-        vectorstore = create_vectorstore(documents)
-        rag_chain = setup_rag_chain(vectorstore)
-        response = rag_chain.run(query)
+documents = load_data()
+vectorstore = create_vectorstore(documents)
+llm = load_llm()
+rag_chain = setup_rag_chain(vectorstore, llm)
 
-        st.markdown("### Information")
-        st.write(response)  # Output as plain text
+query = st.text_input(
+    "Enter a disease name to extract information:"
+)
+
+if query:
+    if rag_chain is None:
+        st.error(
+            "⚠️ System not ready. Check CSV file, dependencies, and API key."
+        )
+    else:
+        with st.spinner("🔍 Searching..."):
+            try:
+                response = rag_chain.run(query)
+
+                st.subheader("📋 Extracted Information")
+                st.write(response)
+
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 st.markdown("---")
-
+st.caption("Powered by Groq Llama 3, FAISS, LangChain and Sentence Transformers")
